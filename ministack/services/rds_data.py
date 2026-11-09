@@ -548,7 +548,8 @@ def _field_value(val, type_name=None):
         return {"longValue": val}
     if isinstance(val, float):
         return {"doubleValue": val}
-    if isinstance(val, bytes):
+    # psycopg2 returns PostgreSQL bytea as memoryview, not bytes.
+    if isinstance(val, (bytes, bytearray, memoryview)):
         import base64
         return {"blobValue": base64.b64encode(val).decode()}
     return {"stringValue": str(val)}
