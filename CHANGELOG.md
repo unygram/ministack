@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **RDS Data API — SQL lock waits no longer freeze the server** — database operations run off the HTTP event loop without consuming the shared bounded worker pool, so a blocked query cannot prevent another request from committing or rolling back its lock holder. Overlapping operations on one transaction are rejected while its connection is busy; cancellation and reset retain safe connection ownership, and failed completion closes the connection. Covered by deterministic concurrency tests and disposable PostgreSQL row-lock regressions; busy-transaction errors follow AWS documentation, not a live AWS observation.
+
 ## [1.5.39] — 2026-11-08
 
 ### Added
