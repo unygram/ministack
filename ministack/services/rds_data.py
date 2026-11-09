@@ -13,13 +13,15 @@ import threading
 import uuid
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import AccountRegionScopedDict, error_response_json, get_account_id, json_response
 
 logger = logging.getLogger("rds-data")
 
-# Active transactions: txn_id -> {conn, engine, resourceArn, database}
+# Active transactions: txn_id -> {conn, engine, resourceArn, database, busy?, discard?}
 _transactions: dict = {}
 _lock = threading.Lock()
+_generation = 0
 
 # In-memory tracking for stub mode: remember databases/users created via SQL.
 # Keyed by cluster identifier.
@@ -345,6 +347,40 @@ def _transaction_completion_not_found_error(txn_id):
     )
 
 
+def _claim_transaction(txn_id, resource_arn, *, completing=False):
+    """Lease one connection without waiting on SQL or another request's lease."""
+    with _lock:
+        txn = _transactions.get(txn_id)
+        if not txn or txn.get("resourceArn") != resource_arn:
+            error = _transaction_completion_not_found_error if completing else _transaction_not_found_error
+            return None, error(txn_id)
+        if txn.get("busy"):
+            # Documented Aurora PostgreSQL Data API behavior; do not queue work
+            # on a connection that may be executing, committing or rolling back.
+            return None, _error("DatabaseErrorException", "Transaction is still running a query")
+        txn["busy"] = True
+        return txn, None
+
+
+def _close_connection(conn):
+    try:
+        conn.close()
+    except Exception:
+        logger.warning("Failed to close an RDS Data API connection")
+
+
+def _release_transaction(txn_id, txn, *, completed=False):
+    with _lock:
+        txn["busy"] = False
+        if completed and _transactions.get(txn_id) is txn:
+            _transactions.pop(txn_id)
+        close = completed or txn.get("discard", False)
+    # reset() may retire an in-flight transaction, but must not close its
+    # connection until the driver call has actually finished.
+    if close:
+        _close_connection(txn["conn"])
+
+
 def _validate_http_endpoint_enabled(cluster, resource_arn):
     if cluster is not None and not cluster.get("HttpEndpointEnabled", False):
         return _http_endpoint_not_enabled_error(resource_arn)
@@ -617,7 +653,11 @@ async def handle_request(method, path, headers, body, query_params):
     handler = handlers.get(path)
     if not handler:
         return _error("BadRequestException", f"Unknown RDS Data API path: {path}")
-    return handler(data)
+    # A SQL lock wait can depend on a *different HTTP request* committing or
+    # rolling back. The shared bounded pool can deadlock in exactly the same
+    # way as the event loop when all its workers wait for those requests.
+    # Preserve request ContextVars and keep the worker alive through cancellation.
+    return await run_reentrant(handler, data, thread_name="ministack-rds-data")
 
 
 def _execute_statement(data):
@@ -647,12 +687,12 @@ def _execute_statement(data):
         return secret_error
 
     conn = None
+    txn = None
     if txn_id:
-        with _lock:
-            txn = _transactions.get(txn_id)
-            if not txn or txn.get("resourceArn") != resource_arn:
-                return _transaction_not_found_error(txn_id)
-            conn = txn["conn"]
+        txn, error = _claim_transaction(txn_id, resource_arn)
+        if error:
+            return error
+        conn = txn["conn"]
 
     # Keep stub mode for intentional mock environments only. Once RDS has a
     # real container-backed endpoint, connection failures must surface as
@@ -661,19 +701,19 @@ def _execute_statement(data):
     # connection; stub mode is only available to non-transactional requests.
     if not txn_id and not _has_real_endpoint(instance):
         logger.info("No endpoint for %s, using stub mode", resource_arn)
-        return _stub_execute(resource_arn, sql)
-
-    # Convert :name placeholders to %(name)s for DB-API
-    params = _convert_parameters(parameters)
-    exec_sql = _substitute_named_params(sql, params)
+        with _lock:
+            return _stub_execute(resource_arn, sql)
 
     own_conn = False
+    cursor = None
     try:
+        # Convert parameters inside the lease's cleanup boundary as well.
+        params = _convert_parameters(parameters)
+        exec_sql = _substitute_named_params(sql, params)
         if conn is None:
-            with _lock:
-                conn = _connect(instance, engine, database, password,
-                                username=secret_user)
-                own_conn = True
+            conn = _connect(instance, engine, database, password,
+                            username=secret_user)
+            own_conn = True
 
         cursor = conn.cursor()
         cursor.execute(exec_sql, params or None)
@@ -707,23 +747,27 @@ def _execute_statement(data):
         else:
             response["records"] = []
 
-        cursor.close()
-        if own_conn:
-            conn.close()
-
         return json_response(response)
 
     except ImportError as e:
-        if own_conn and conn:
-            conn.close()
         return _error("BadRequestException", str(e))
     except Exception as e:
-        if own_conn and conn:
-            conn.close()
         return _sql_execution_error(e)
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if txn is not None:
+            _release_transaction(txn_id, txn)
+        elif own_conn:
+            _close_connection(conn)
 
 
 def _begin_transaction(data):
+    with _lock:
+        generation = _generation
     resource_arn = data.get("resourceArn")
     secret_arn = data.get("secretArn")
     database = data.get("database")
@@ -744,6 +788,7 @@ def _begin_transaction(data):
     if secret_error:
         return secret_error
 
+    conn = None
     try:
         conn = _connect(instance, engine, database, password,
                         username=secret_user)
@@ -752,62 +797,40 @@ def _begin_transaction(data):
         else:
             conn.autocommit = False
     except ImportError as e:
+        if conn is not None:
+            _close_connection(conn)
         return _error("BadRequestException", str(e))
     except Exception as e:
+        if conn is not None:
+            _close_connection(conn)
         return _sql_execution_error(e)
 
     txn_id = str(uuid.uuid4())
     with _lock:
-        _transactions[txn_id] = {
-            "conn": conn,
-            "engine": engine,
-            "resourceArn": resource_arn,
-            "database": database,
-        }
+        stale = generation != _generation
+        if not stale:
+            _transactions[txn_id] = {
+                "conn": conn,
+                "engine": engine,
+                "resourceArn": resource_arn,
+                "database": database,
+            }
+    if stale:
+        _close_connection(conn)
+        return _transient_database_error("Database state was reset while beginning the transaction")
 
     return json_response({"transactionId": txn_id})
 
 
 def _commit_transaction(data):
-    txn_id = data.get("transactionId")
-    if not txn_id:
-        return _error("BadRequestException", "transactionId is required")
-    resource_arn = data.get("resourceArn")
-    secret_arn = data.get("secretArn")
-    if not resource_arn:
-        return _error("BadRequestException", "resourceArn is required")
-    if not secret_arn:
-        return _error("BadRequestException", "secretArn is required")
-
-    instance, engine, cluster = _resolve_target(resource_arn)
-    endpoint_error = _validate_http_endpoint_enabled(cluster, resource_arn)
-    if endpoint_error:
-        return endpoint_error
-    if not instance:
-        return _cluster_resolution_error(resource_arn, engine)
-    _secret_user, _password, secret_error = _require_secret_credentials(secret_arn)
-    if secret_error:
-        return secret_error
-
-    with _lock:
-        txn = _transactions.get(txn_id)
-        if txn and txn.get("resourceArn") != resource_arn:
-            return _transaction_completion_not_found_error(txn_id)
-        if txn:
-            _transactions.pop(txn_id)
-    if not txn:
-        return _transaction_completion_not_found_error(txn_id)
-
-    try:
-        txn["conn"].commit()
-        txn["conn"].close()
-    except Exception as e:
-        return _error("BadRequestException", f"Commit failed: {e}")
-
-    return json_response({"transactionStatus": "Transaction Committed"})
+    return _complete_transaction(data, "commit")
 
 
 def _rollback_transaction(data):
+    return _complete_transaction(data, "rollback")
+
+
+def _complete_transaction(data, operation):
     txn_id = data.get("transactionId")
     if not txn_id:
         return _error("BadRequestException", "transactionId is required")
@@ -828,22 +851,19 @@ def _rollback_transaction(data):
     if secret_error:
         return secret_error
 
-    with _lock:
-        txn = _transactions.get(txn_id)
-        if txn and txn.get("resourceArn") != resource_arn:
-            return _transaction_completion_not_found_error(txn_id)
-        if txn:
-            _transactions.pop(txn_id)
-    if not txn:
-        return _transaction_completion_not_found_error(txn_id)
+    txn, error = _claim_transaction(txn_id, resource_arn, completing=True)
+    if error:
+        return error
 
     try:
-        txn["conn"].rollback()
-        txn["conn"].close()
+        getattr(txn["conn"], operation)()
     except Exception as e:
-        return _error("BadRequestException", f"Rollback failed: {e}")
+        return _error("BadRequestException", f"{operation.capitalize()} failed: {e}")
+    finally:
+        _release_transaction(txn_id, txn, completed=True)
 
-    return json_response({"transactionStatus": "Transaction Rolled Back"})
+    status = "Transaction Committed" if operation == "commit" else "Transaction Rolled Back"
+    return json_response({"transactionStatus": status})
 
 
 def _batch_execute_statement(data):
@@ -874,17 +894,18 @@ def _batch_execute_statement(data):
 
     own_conn = False
     conn = None
+    txn = None
+    cursor = None
     try:
-        with _lock:
-            if txn_id:
-                txn = _transactions.get(txn_id)
-                if not txn or txn.get("resourceArn") != resource_arn:
-                    return _transaction_not_found_error(txn_id)
-                conn = txn["conn"]
-            else:
-                conn = _connect(instance, engine, database, password,
-                                username=secret_user)
-                own_conn = True
+        if txn_id:
+            txn, error = _claim_transaction(txn_id, resource_arn)
+            if error:
+                return error
+            conn = txn["conn"]
+        else:
+            conn = _connect(instance, engine, database, password,
+                            username=secret_user)
+            own_conn = True
 
         cursor = conn.cursor()
         update_results = []
@@ -902,33 +923,39 @@ def _batch_execute_statement(data):
                 cursor.execute(exec_sql, params or None)
                 update_results.append({"generatedFields": _generated_fields(cursor, engine)})
 
-        cursor.close()
-        if own_conn:
-            conn.close()
-
         return json_response({"updateResults": update_results})
 
     except ImportError as e:
-        if own_conn and conn:
-            conn.close()
         return _error("BadRequestException", str(e))
     except Exception as e:
-        if own_conn and conn:
-            conn.close()
         return _sql_execution_error(e)
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if txn is not None:
+            _release_transaction(txn_id, txn)
+        elif own_conn:
+            _close_connection(conn)
 
 
 def reset():
+    global _generation
     with _lock:
+        _generation += 1
+        idle = []
         for txn in _transactions.values():
-            try:
-                txn["conn"].close()
-            except Exception:
-                pass
+            txn["discard"] = True
+            if not txn.get("busy"):
+                idle.append(txn["conn"])
         _transactions.clear()
-    _stub_databases.clear()
-    _stub_users.clear()
-    _stub_grants.clear()
+        _stub_databases.clear()
+        _stub_users.clear()
+        _stub_grants.clear()
+    for conn in idle:
+        _close_connection(conn)
 
 
 def get_state() -> dict:
