@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **RDS Data API — PostgreSQL binary results** — `bytea` values returned by psycopg2 as `memoryview` were serialized as memory-object strings. Binary buffers now return base64 `blobValue` fields, including empty values, so SDK clients can read encrypted keys and other binary records. Covered by response and disposable PostgreSQL regressions; the wire shape follows AWS documentation, not a live AWS observation.
+
 ## [1.5.39] — 2026-11-08
 
 ### Added
